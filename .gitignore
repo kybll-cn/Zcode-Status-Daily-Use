@@ -1,0 +1,23 @@
+# 安装器生成的本地配置（含本机绝对路径与 asar 路径，不应提交）
+config.json
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 发布包
+*.zip
+dist/
+
+# 测试生成的预览产物
+tests/preview.html
+tests/preview.png
+
+# 桌面一键安装脚本是生成物（含本机路径），不入库
+安装今日用量.bat
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
