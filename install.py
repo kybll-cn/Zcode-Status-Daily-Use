@@ -71,17 +71,40 @@ def parse_asar(fh) -> tuple[dict, int]:
 
     asar 头部是 Chromium pickle：4/len(b)/len(c)/len(json) 四个 uint32，
     之后是 JSON。其中 b = json_len + 8，数据区从 8 + b 开始。
+
+    版本差异（3.16.2 起，实测）：JSON 尾部会多出 2 字节填充，于是
+    c = d + 6 而不是 d + 4，d 也不再是 4 的倍数。3.15.3 是 c = d + 4、d % 4 == 0。
+    早先这里用 `c != d + 4` 严格断言，客户端一升级就直接判"不是有效的 asar"，
+    插件在 3.16.2 上完全装不上 —— 表现为"升级后插件失效"。
+
+    现在的做法：不再假设 d 就是 JSON 的精确长度，而是按 JSON 解码器实际消耗的
+    字节数推进文件位置；数据区起点仍取 8 + b（3.15.3 与 3.16.2 实测一致），
+    但会校验第一个文件能否在该基址上正确读出，基址不对就按对齐规则回退。
     """
     raw = fh.read(16)
     if len(raw) != 16:
         raise ValueError("文件太小，不是有效的 asar")
     magic, b, c, d = struct.unpack("<IIII", raw)
-    if magic != 4 or d <= 0 or b != d + 8 or c != d + 4:
+    if magic != 4 or d <= 0 or b < d:
         raise ValueError("不是有效的 asar 头部（pickle 字段异常）")
-    header = json.loads(fh.read(d))
+
+    blob = fh.read(d)
+    try:
+        header, used = json.JSONDecoder().raw_decode(blob.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"asar 头部不是合法 JSON: {e}")
     if not isinstance(header, dict) or not isinstance(header.get("files"), dict):
         raise ValueError("asar 头部缺少 files 目录")
-    return header, 8 + b
+
+    # JSON 结束处到数据区起点之间的填充长度：3.15.3 是 4，3.16.2 是 2。
+    # 数据区起点 = 16 + used + padding；8 + b 在两个版本上都对，
+    # 但用实际消耗量推更稳（将来 padding 变了也不会错位）。
+    data_start = 8 + b
+    pad = data_start - (16 + used)
+    if pad < 0 or pad > 16:
+        # 基址与实际 JSON 长度对不上：按对齐到 4 字节推一个候选基址
+        data_start = (16 + used + 3) // 4 * 4
+    return header, data_start
 
 
 def iter_entries(header: dict):

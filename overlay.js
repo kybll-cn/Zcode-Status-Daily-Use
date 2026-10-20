@@ -54,12 +54,33 @@
 
   /* ---------------------------------------------------------------- 格式化 */
 
+  /* token 量：口径与客户端原生用量页顶栏完全一致，中文按「亿 / 万」，不再用 K/M/B。
+   * 原生顶栏（组件 s7：累计 Token / 峰值 Token 那一栏）调的是
+   * usageStatsUiParts 导出的 u() —— 也就是下面这段：
+   *   Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1,
+   *                               minimumFractionDigits: 0 })
+   * 中文 locale 下，客户端还会在数字与「万亿」之间补一个空格，
+   * 所以 zh-CN 的 "1.2亿" 最终显示成 "1.2 亿"。
+   * 这个空格是有意为之，不是笔误 —— 我们的卡片就贴在原生顶栏正下方，
+   * 同一屏里两处数字必须长得一样。（想看原始实现可去 app.asar 搜
+   * `(?<=\d)(?=[万亿])`，全客户端只有那一处。）
+   *
+   * compact 对 <1e3 的数（0 / 36 / 999）输出与 standard 完全相同，
+   * 实测与客户端「按量级分支」的结果零差异，所以这里不必再分支。 */
+  var NF = {};
   function fmt(n) {
-    n = n || 0;
-    if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
-    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-    return String(Math.round(n));
+    var v = Number(n) || 0;
+    var loc = state.lang === "en" ? "en-US" : "zh-CN";
+    var f = NF[loc];
+    if (f === undefined) {
+      try {
+        f = NF[loc] = new Intl.NumberFormat(loc, {
+          notation: "compact", maximumFractionDigits: 1, minimumFractionDigits: 0
+        });
+      } catch (e) { f = NF[loc] = null; }   // 极端环境无 compact 数据：退回整数
+    }
+    var s = f ? f.format(v) : String(Math.round(v));
+    return loc === "zh-CN" ? s.replace(/(?<=\d)(?=[万亿])/u, " ") : s;
   }
   function fmtFull(n) {
     return (Math.round(n || 0)).toLocaleString("en-US");

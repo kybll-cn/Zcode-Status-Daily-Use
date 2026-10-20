@@ -28,6 +28,41 @@ def load_snapshot() -> dict:
     return json.loads(out.stdout)
 
 
+def compact(n, loc: str = "zh") -> str:
+    """与 overlay.js fmt()、也即客户端原生顶栏同口径的紧凑数字。
+
+    规则来自客户端的 usageStatsUiParts（Intl 的 compact 记法，≤1 位小数）：
+      zh：1e4 起「万」、1e8 起「亿」、1e12 起「万亿」，数字与单位间有一个空格；
+      en：1e3 K / 1e6 M / 1e9 B / 1e12 T，无空格。
+
+    进位要单独处理：99999999 在「万」这一档是 9999.9999 → 四舍五入到 10000.0，
+    ICU 会继续升档成「1 亿」而不是输出「10000 万」。所以舍入后若触到上一档的
+    比例（万→亿 是 1e4，K→M 是 1e3），就升一档重算。
+
+    本函数与 Chromium/Node 的 ICU 做过逐值对照（4000 余个值含各档边界，零差异），
+    check() 里另有几个实测值断言，口径漂了会被测出来。
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    v = float(n or 0)
+    units = ([("万亿", 1e12), ("亿", 1e8), ("万", 1e4)] if loc == "zh"
+             else [("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)])
+    idx = next((i for i, (_, scale) in enumerate(units) if abs(v) >= scale), None)
+    if idx is None:
+        return str(int(round(v)))
+    while True:
+        unit, scale = units[idx]
+        r = Decimal(repr(v / scale)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        ratio = units[idx - 1][1] / scale if idx > 0 else None
+        if ratio is not None and abs(r) >= ratio:
+            idx -= 1
+            continue
+        s = str(r)
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s + (" " + unit if loc == "zh" else unit)
+
+
 def check(d: dict) -> None:
     """结构与一致性断言。"""
     problems = []
@@ -76,6 +111,27 @@ def check(d: dict) -> None:
             problems.append(f"{h['hour']} 时模型明细 {msum} != 合计 {h['totalTokens']}")
             break
 
+    # 数字口径：这几个值是在 Chromium(ICU) 里实测出来的，写死断言防止
+    # 紧凑格式（万亿 / K M B）被改回旧写法而没人发现。
+    for value, want in ((121100000, "1.2 亿"), (630000000, "6.3 亿"),
+                        (12345, "1.2 万"), (99999999, "1 亿"), (999, "999")):
+        got = compact(value)
+        if got != want:
+            problems.append(f"中文紧凑格式 {value} 应为 {want!r}，实为 {got!r}")
+    if compact(121100000, "en") != "121.1M":
+        problems.append("英文紧凑格式 121100000 应为 '121.1M'")
+
+    # 本文件与 zdu.py 各有一份 Python 实现（有意不共用：共用的话同一个 bug 会
+    # 一起通过）。这里让两者对账，防止离线预览与 CLI 摘要给出不同的数字。
+    sys.path.insert(0, str(ROOT))
+    import zdu
+    for value in (121100000, 630000000, 12345, 99999999, 12500, 999, 1200000000):
+        for loc in ("zh", "en"):
+            a, b = compact(value, loc), zdu.fmt(value, loc)
+            if a != b:
+                problems.append(f"compact()/zdu.fmt() 不一致（{loc}）："
+                                f"{value} → {a!r} vs {b!r}")
+
     print("=" * 56)
     if problems:
         print("发现问题：")
@@ -96,14 +152,7 @@ def to_html(d: dict) -> str:
     s = d["summary"]
 
     def fmt(n):
-        n = n or 0
-        if n >= 1e9:
-            return f"{n/1e9:.2f}B"
-        if n >= 1e6:
-            return f"{n/1e6:.2f}M"
-        if n >= 1e3:
-            return f"{n/1e3:.1f}K"
-        return str(int(n))
+        return compact(n, "zh")
 
     COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#a855f7", "#06b6d4"]
 

@@ -106,15 +106,38 @@ def _load_lang(cfg: dict) -> str:
     return "en" if lang == "en" else "zh"
 
 
-def fmt(n) -> str:
-    n = n or 0
-    if n >= 1_000_000_000:
-        return f"{n / 1e9:.2f}B"
-    if n >= 1_000_000:
-        return f"{n / 1e6:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1e3:.1f}K"
-    return str(int(n))
+def fmt(n, lang: str = "zh") -> str:
+    """token 量的紧凑写法，与 overlay.js / 客户端原生用量页顶栏同口径。
+
+    zh：1e4 起「万」、1e8 起「亿」、1e12 起「万亿」，数字与单位间有一个空格
+        （空格是客户端自己的选择，理由见 overlay.js 里 fmt() 的注释）；
+    en：K / M / B / T，无空格。小数最多一位 —— 也跟客户端一样。
+
+    舍入后要检查是否该升档：99999999 在「万」档是 9999.9999，一位小数舍入成
+    10000.0，ICU 给的是「1 亿」而不是「10000 万」，所以触到上一档比例就升一档重算。
+    这个实现与 Chromium/Node 的 ICU 逐值对照过（见 tests/render_test.py 的 compact()），
+    两边必须保持一致。
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    zh = lang != "en"
+    v = float(n or 0)
+    units = ([("万亿", 1e12), ("亿", 1e8), ("万", 1e4)] if zh
+             else [("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)])
+    idx = next((i for i, (_, scale) in enumerate(units) if abs(v) >= scale), None)
+    if idx is None:
+        return str(int(round(v)))
+    while True:
+        unit, scale = units[idx]
+        r = Decimal(repr(v / scale)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        ratio = units[idx - 1][1] / scale if idx > 0 else None
+        if ratio is not None and abs(r) >= ratio:
+            idx -= 1
+            continue
+        s = str(r)
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s + (" " + unit if zh else unit)
 
 
 # ---------------------------------------------------------------- 主聚合
@@ -427,14 +450,15 @@ def render_text(cfg: dict) -> str:
     z = s["summary"]
     L = _load_lang(cfg)
     tag = "Today" if L == "en" else "今日"
+    f = lambda n: fmt(n, L)
     out = [
         f"■ {tag} ({s['range']['date']}  {s['timeZone']})",
         f"  请求 {z['requests']}  轮 {z['totalTurns']}  会话 {z['totalSessions']}",
-        f"  input {fmt(z['inputTokens'])} (缓存读 {fmt(z['cacheReadTokens'])}, "
-        f"命中 {z['cacheHitRate'] * 100:.2f}%)  output {fmt(z['outputTokens'])}  "
-        f"合计 {fmt(z['totalTokens'])}",
-        f"  主会话 {z['mainRequests']}req/{fmt(z['mainTokens'])}  "
-        f"子代理 {z['subRequests']}req/{fmt(z['subTokens'])}",
+        f"  input {f(z['inputTokens'])} (缓存读 {f(z['cacheReadTokens'])}, "
+        f"命中 {z['cacheHitRate'] * 100:.2f}%)  output {f(z['outputTokens'])}  "
+        f"合计 {f(z['totalTokens'])}",
+        f"  主会话 {z['mainRequests']}req/{f(z['mainTokens'])}  "
+        f"子代理 {z['subRequests']}req/{f(z['subTokens'])}",
         f"  活跃时段 {z['activeHours']}/24  工具 {z['toolCalls']} 次",
     ]
     return "\n".join(out)

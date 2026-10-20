@@ -2,6 +2,21 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 改变
+
+- **token 数字改为中文口径（亿 / 万），与原生顶栏完全一致。** 原先概览的「合计 token」
+  显示 `121.10M`，一屏之内正上方的原生顶栏却是 `6.3 亿`，两种量级并排看着别扭。
+  现在中文界面统一用 `Intl.NumberFormat` 的 compact 记法：`1.2 亿` / `1.2 万` / `999`，
+  最多一位小数。
+  口径不是自己定的 —— 客户端原生顶栏（组件 `s7`）调的是 `usageStatsUiParts` 导出的
+  `u()`，即 `notation: "compact"` + `maximumFractionDigits: 1`，并且**中文时刻意在数字与
+  「万亿」之间插一个空格**（`6.3 亿`）。这个空格在全客户端只出现一处，是有意为之，
+  所以本插件也照做，免得紧挨着的两处数字长得不一样。
+  英文界面仍是 `K / M / B / T`，无空格，只是小数位从两位收敛到一位（同样跟客户端一致）。
+  `zdu.py text`、离线预览、`color_test.js` 的输出也一并换成同一口径。
+
 ## [1.0.0]
 
 首版。给 ZCode 设置页的「用量」补上**今日**视角：在原生顶栏（累计 Token / 峰值 /
@@ -75,7 +90,7 @@
 node tests/push_test.js     注入代码在标题含 U+2028/2029 时语法仍合法
 node tests/pump_test.js     限频分支静态检查 + 5 个场景行为重放
 node tests/color_test.js    配色跨图一致性
-python tests/render_test.py 真实数据离线渲染 + 分桶与汇总对账
+python tests/render_test.py 真实数据离线渲染 + 分桶与汇总对账 + 数字格式口径
 ```
 
 另附 `install.py --standalone` 供外部脚本调用（跳过进程检查，输出按 UTF-8）。

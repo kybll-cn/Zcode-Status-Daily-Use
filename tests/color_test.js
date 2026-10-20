@@ -37,12 +37,17 @@ function colorOfModel(map, id) {
 
 const { map, ranked } = buildModelColors(d.models);
 
+/* token 量按界面口径显示（亿 / 万，与客户端原生顶栏一致），方便和卡片对照 */
+const zh = (n) => new Intl.NumberFormat("zh-CN", {
+  notation: "compact", maximumFractionDigits: 1, minimumFractionDigits: 0,
+}).format(n || 0).replace(/(?<=\d)(?=[万亿])/u, " ");
+
 let ok = true;
 console.log("=".repeat(62));
 console.log("当日模型排名 → 分配的固定色位：");
 ranked.forEach((m, i) => {
   console.log(`  ${i + 1}. ${String(m.modelId).padEnd(34)} ` +
-              `${(m.totalTokens / 1e6).toFixed(2)}M  →  色位 ${i + 1}`);
+              `${zh(m.totalTokens)}  →  色位 ${i + 1}`);
 });
 
 /* 断言 1：色位不重复 */
