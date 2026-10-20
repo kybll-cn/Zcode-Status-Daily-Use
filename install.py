@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 PLUGIN_NAME = "Zcode-Status-Daily-Use"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 PLUGIN_FILES = ("inject-main.cjs", "overlay.js", "zdu.py")
 INJECT_MARKER = "[zdaily] load failed"
 
