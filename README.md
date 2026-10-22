@@ -1,6 +1,7 @@
 # Zcode-Status-Daily-Use
 
 给 ZCode 设置页的「用量」加一个 **今日** 视图：当天概览 + 24 小时分布 + 按模型 / 按会话明细。
+**支持远程**：云端 / WSL / SSH / Docker 上的任务也一并统计进来。
 
 原生用量页只有 `全部 / 7 天 / 30 天` 三档，最细到「天」，看不到「今天什么时候在用、用了多少」。
 本插件在不改动客户端任何逻辑的前提下，在原生顶栏（累计 Token / 峰值 / 最长聊天 / 连续天数）
@@ -15,6 +16,7 @@
 ├─────────────────────────────────────┤
 │  今日用量                             │  ← 本插件插在这里
 │  [合计token][请求][缓存命中][活跃时段] │
+│  来源（本地 + 远程）                   │  ← 配了远程源才有
 │  24 小时分布（按模型堆叠）             │
 │  按模型            按会话             │
 └─────────────────────────────────────┘
@@ -64,6 +66,7 @@ uninstall.bat
 | 区块 | 内容 |
 | --- | --- |
 | 概览 | 合计 token、请求数与轮数、缓存命中率与新增、活跃时段（3/24）与首末时间 |
+| 来源 | 各数据源的 token 占比（配了远程源才有）。取数失败的源标红并显示原因 |
 | 24 小时分布 | 0–23 点堆叠柱，按模型分层，6 色沿用客户端 `--color-usage-chart-*` |
 | 按模型 | 当天各模型 token 占比与请求数 |
 | 按会话 | 当天最耗的会话，标题 + 工作目录名 + 次数 + 最后活动时间 |
@@ -91,6 +94,9 @@ uninstall.bat
    但计入概览。因此「分桶合计」会比「概览合计」略小，当前是 914 token / 约 2 万分点，属正常。
 6. **子代理单列**，不与主会话混算 —— 混算数字会偏大，也与状态栏显示对不上。
 
+配置了远程源时，本地与各远端跑的是**同一份 SQL、同一套口径**（远端执行的就是本插件的
+`zdu.py` 副本），差别只在查的时间窗 —— 见「远程任务」一节。
+
 ---
 
 ## 工作方式
@@ -100,14 +106,82 @@ uninstall.bat
   ├ fs.watch db 目录 ──┐                ├ 挂在原生用量区之后
   ├ 心跳兜底 ──────────┤                ├ MutationObserver 跟随路由切换
   │                    ↓                └ window.__zduUpdate(payload)
-  └ 常驻 python zdu.py ←──────────────────── 渲染
+  └ 常驻 python zdu_multi.py ←──────────── 渲染
      (stdin/stdout 行协议)                  
+     ├ 本地：zdu.py 读本机 db
+     └ 远程：zdu_remote.py 送脚本 + 取数
+              └ 远端 zdu.py 读远端 db
 ```
 
-- **零空闲开销**：`fs.watch` 监听 db 写入（去抖 300ms）+ 60s 心跳兜底；没有写入且没有窗口时不取数。
+- **零空闲开销**：`fs.watch` 监听 db 写入（去抖 300ms）+ 心跳兜底；没有写入且没有窗口时不取数。
 - **常驻查询**：python 进程常驻，省掉每次 60–100ms 的解释器启动开销；崩溃自动重启，30 秒内连续 3 次判不稳定则回退一次性 spawn。
-- **热更新**：`overlay.js` / `zdu.py` 改动后 mtime 触发重注入，无需重启客户端。`overlay.js` 载入前经 `new Function` 语法校验，避免载入写到一半的文件。
+- **热更新**：`overlay.js` / `zdu*.py` 改动后 mtime 触发重注入，无需重启客户端。`overlay.js` 载入前经 `new Function` 语法校验，避免载入写到一半的文件。
 - **限频**：默认 8s 一次（`activity_min_ms`），窗口内最后一笔写入一定补拉。
+- **配了远程源时**：心跳自动收到 6s，限频不再因「本机没写入」而放宽 ——
+  远端写入不改变本机 db 的 mtime，`fs.watch` 永远不触发，刷新只能靠心跳。
+- **按内容重绘**：渲染端比对数据指纹，变了才重画，避免每轮心跳重建 SVG。
+
+---
+
+## 远程任务（云端 / WSL / SSH / Docker）
+
+在别处跑的任务，本机用量页是看不到的 —— 客户端的用量由**发起模型请求的那个进程**
+写进它自己持有的库，远程 agent 在远端跑，用量就落在远端。而客户端的
+`getAppUsageStats` 只查当前活动 workspace 那一个来源，没有跨机汇总。
+
+所以本插件自己跨机取数再合并。配好远程源后，「今日用量」里的合计、24 小时分布、
+按模型、按会话都是**本地 + 远程**的合并结果。
+
+### 配置
+
+`config.json` 里加 `remote_sources`：
+
+```json
+{
+  "local_label": "本机",
+  "remote_sources": [
+    { "kind": "wsl", "distro": "Ubuntu-24.04", "user": "kybll" },
+    { "kind": "ssh", "host": "1.2.3.4", "user": "root", "port": 22 },
+    { "kind": "docker", "container": "zcode-agent" }
+  ]
+}
+```
+
+每个源可选：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `kind` | — | `wsl` / `ssh` / `docker` |
+| `label` | 自动 | 卡片上显示的名字，如 `WSL:Ubuntu-24.04` |
+| `timeout` | `20` | 单次调用超时秒数 |
+| `python` | `python3` | 远端解释器 |
+| `home` | `$HOME` | 远端 home（必须是绝对路径） |
+| `enabled` | `true` | 设 `false` 则跳过这个源 |
+
+改完配置**不用重启 ZCode** —— 插件每 2 秒重读一次配置。
+
+### 要求
+
+- 远端要有 `python3` 和 `sqlite3`（绝大多数 Linux 发行版自带）；
+- SSH 要配好免密（插件用 `BatchMode=yes`，不会卡在密码提示上）；
+- Docker 要能 `docker exec`；
+- WSL 用 `wsl.exe -d <发行版> -u <用户>`，Windows 侧要能调到 `wsl.exe`。
+
+远端需要的脚本由插件自动部署到 `~/.zcode/zcode-status-daily-use/zdu.py`，
+比对 sha256，一致就不重传。远端库的查找顺序与客户端完全一致
+（`ZCODE_SESSION_DB_PATH` → `~/.zcode/cli/config.json` 的 `storage.sessionDbPath`
+→ `~/.zcode/cli/db/db.sqlite`），所以你改了客户端的库路径，插件也跟得上。
+
+### 合并口径
+
+- 各源按**同一个绝对时间窗**查询（窗口由本机算好后原样传给远端），避免跨时区错位；
+  代价是「今天」以本机时区为准。
+- 合计、请求数等逐项相加；但**缓存命中率**与模型**占比**按合并后的分子分母重算，
+  **活跃时段**按合并后的 24 个桶重算（各源相加会把同一时段重复计）。
+- 某个源取数失败不影响其它源 —— 卡片上那个源会标红并显示失败原因，
+  不会假装它没有用量。
+
+详细的机制说明与代码证据见 [docs/remote-notes.md](docs/remote-notes.md)。
 
 ---
 
@@ -132,6 +206,8 @@ uninstall.bat
 | `include_subagent` | `true` | 会话列表是否含子代理 |
 | `lang` | `"zh"` | `zh` / `en` |
 | `python_path` | 自动 | 安装时写入当前 Python 路径 |
+| `local_label` | `"本机"` | 本地源在「来源」分区里的显示名 |
+| `remote_sources` | `[]` | 远程源列表，见上文「远程任务」 |
 
 > **改 `inject-main.cjs` 必须重启 ZCode** —— 它是主进程代码，在启动时加载一次；
 > 只有 `overlay.js` 会被热更新。
@@ -149,8 +225,16 @@ uninstall.bat
 **命令行直接查数据** —— 不经过客户端，验证数据层本身：
 
 ```bat
-python zdu.py text      % 文字摘要
-python zdu.py json      % 完整 JSON 快照
+python zdu.py text          % 本机文字摘要
+python zdu.py json          % 本机完整 JSON 快照
+python zdu_multi.py text    % 多源（本地 + 远程）摘要
+python zdu_multi.py json    % 多源合并后的完整 JSON
+```
+
+**查某个远程源通不通** —— 不部署脚本，只探测远端有没有 python3、库在哪：
+
+```bat
+python tests/remote_probe.py
 ```
 
 **离线渲染检查** —— 用真实数据验证渲染逻辑与数据一致性，产出 `tests/preview.html`：
@@ -162,6 +246,14 @@ python tests/render_test.py
 它会断言：字段完整、24 小时分桶合计不超过汇总、活跃小时数与图一致、每个小时的模型明细之和等于该小时合计，
 以及数字紧凑格式（`121100000` → `1.2 亿`，`12345` → `1.2 万`）与客户端口径一致。
 
+**多源回归测试** —— 合并口径 + 真实远程通道 + 常驻协议：
+
+```bat
+python tests/remote_test.py     % 合并口径、WSL 通道、端到端合并
+python tests/serve_test.py      % 常驻 serve 协议
+node tests/render_remote_test.js % 来源分区渲染、数据变化重绘
+```
+
 ---
 
 ## 已知限制
@@ -169,6 +261,12 @@ python tests/render_test.py
 - 客户端升级后 `app.asar` 被覆盖，需重跑安装器。
 - 只在 `设置 → 用量` 页挂载，其他页面不显示（这是设计如此，避免干扰主界面）。
 - 金额不显示：本地没有任何价格数据（模型目录、数据库、`local_setting` 都没有），不做编造。
+- **远程的「今天」以本机时区为准。** 各源按同一个绝对时间窗查询，跨时区时
+  远端的凌晨时段会落在本机时间轴的对应位置，而不是远端自己的自然日。
+- **远程源只在远端 agent 真的跑过会话后才有数据。** 远端还没建过
+  `~/.zcode/cli/db/db.sqlite` 时，那个源会显示「不可用」，这是正常的。
+- 远程源不支持 `server`（ZCode 自家 server）形态 —— 那条路要研究 ZCode server
+  的控制协议，当前只做了 `wsl` / `ssh` / `docker` 三种。
 
 ---
 
@@ -176,5 +274,6 @@ python tests/render_test.py
 
 GNU Affero General Public License v3.0 —— 与 Zcode-Status-TypeBar 保持一致。
 
-本插件会读取本机的 `~/.zcode/cli/db/db.sqlite`（只读），属于对用户本地数据的程序性访问，
+本插件会读取本机的 `~/.zcode/cli/db/db.sqlite`（只读），并在配置了远程源时
+从远端机器读取对应的用量库（只读），属于对用户数据的程序性访问，
 故沿用 AGPL 而非 MIT。

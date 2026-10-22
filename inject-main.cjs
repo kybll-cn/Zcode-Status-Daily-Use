@@ -3,7 +3,7 @@
  *
  * 职责：
  *   1. 向每个主窗口注入 overlay.js（mtime 变化热更新，免重启）；
- *   2. 取数：常驻 python（zdu.py serve，stdin/stdout 行协议）省解释器启动费，
+ *   2. 取数：常驻 python（zdu_multi.py serve，stdin/stdout 行协议）省解释器启动费，
  *      意外退出自动重启，30s 内连续 3 次判不稳定则回退一次性 spawn；
  *   3. 推送时机：fs.watch 监听 db 目录（去抖 300ms）+ 心跳兜底；
  *      完全空闲时零进程零轮询。限频 config.activity_min_ms（默认 8s）。
@@ -15,6 +15,9 @@
  *   - 只向窗口推数据，不读页面状态 —— 没有窗口（应用退出中）就直接短路，
  *     这是"空闲零进程"的前提。
  *   - 注入代码经 new Function 语法校验后才重注入，避免把写到一半的文件载入页面。
+ *   - 远程源的用量写在远端机器的库里，本机 db 的 mtime 不会因它变化，
+ *     所以 fs.watch 只能覆盖本地源的变化；远程源靠心跳兜底周期拉取。
+ *     配了远程源时，心跳间隔取较小者，避免远程用量延迟太久才显示。
  */
 "use strict";
 const path = require("path");
@@ -25,7 +28,7 @@ const { app, BrowserWindow, webContents } = require("electron");
 const HERE = __dirname;
 const CONFIG = path.join(HERE, "config.json");
 const OVERLAY = path.join(HERE, "overlay.js");
-const ZDU = path.join(HERE, "zdu.py");
+const ZDU = path.join(HERE, "zdu_multi.py");
 const MARK = "zdaily";
 const LOG = (...a) => console.error("[" + MARK + "]", ...a);
 
@@ -33,9 +36,18 @@ const LOG = (...a) => console.error("[" + MARK + "]", ...a);
 
 function readCfg() {
   const c = { python_path: "python", resident: true, hot_reload: true,
-              activity_min_ms: 8000, heartbeat_ms: 6000, idle_push_ms: 4000 };
+              activity_min_ms: 8000, heartbeat_ms: 6000, idle_push_ms: 4000,
+              local_label: "本机", remote_sources: [] };
   try { Object.assign(c, JSON.parse(fs.readFileSync(CONFIG, "utf8"))); } catch (e) { }
   return c;
+}
+
+/* 配了远程源时，本机 db 的 mtime 不再是可靠的触发条件 ——
+ * 远程用量变化时本机什么都不会动，只能靠心跳。 */
+function hasRemote(cfg) {
+  return Array.isArray(cfg.remote_sources) && cfg.remote_sources.some(
+    (s) => s && s.enabled !== false
+  );
 }
 
 let cfgMtime = 0;
@@ -180,10 +192,13 @@ function killResidentForUpgrade() {
 function legacySpawn() {
   const py = spawn(readCfg().python_path, [ZDU, "json"], { windowsHide: true });
   let out = "";
+  /* 有远程源时超时放宽（跨进程 + 可能跨网络）。 */
+  const remoteCount = (readCfg().remote_sources || []).filter(
+    (s) => s && s.enabled !== false).length;
   const killTimer = setTimeout(() => {
     LOG("query timeout, killing");
     try { py.kill(); } catch (e) { }
-  }, 15000);
+  }, 15000 + remoteCount * 25000);
   py.stdout.on("data", (d) => { out += d; });
   py.on("error", (e) => { clearTimeout(killTimer); busy = false; LOG("spawn failed:", e.message); });
   py.on("close", () => {
@@ -207,14 +222,24 @@ function runQuery() {
     if (!pyRes) startResident();
     if (pyRes && pyRes.proc.stdin.writable) {
       const state = pyRes;
+      /* 超时要按「有无远程源」算：配了远程源时一次请求可能要跨进程、
+       * 甚至跨网络到远端机上，本地那 15s 不够，会把好端端的常驻进程反复打死
+       * （3 次早退就回退一次性 spawn，更慢）。
+       * 这里给 15s + 每个远程源 25s 的余量。 */
+      const remoteCount = (readCfgCached().remote_sources || []).filter(
+        (s) => s && s.enabled !== false).length;
+      const timeout = 15000 + remoteCount * 25000;
       const timer = setTimeout(() => {
         LOG("resident query timeout, restarting");
         pyRestarting = true;
         try { state.proc.kill(); } catch (e) { }
         done(null);
-      }, 15000);
+      }, timeout);
       state.waiters.push((payload) => { clearTimeout(timer); done(payload); });
-      try { state.proc.stdin.write("\n"); } catch (e) { }
+      /* 请求行不能是空行 —— serve 那边把空行当作"没有请求"跳过
+       * （那是 zdu.py 起的协议，保留它是为了兼容）。
+       * 这里统一用 "q" 表示"查一次"。 */
+      try { state.proc.stdin.write("q\n"); } catch (e) { }
       return;
     }
   }
@@ -261,13 +286,23 @@ function maybeSpawn() {
   /* 限频。db 有写入时用 activity_min_ms（默认 8s），无写入时用 idle_push_ms
    * （默认 4s）—— 后者不是"没必要的重复计算"，而是保证页面随时可能打开：
    * 早先版本在这里直接 return，导致用户打开设置页时若 db 恰好没新写入，
-   * 卡片就停在"等待数据…"，直到下一次心跳才出现内容。 */
+   * 卡片就停在"等待数据…"，直到下一次心跳才出现内容。
+   *
+   * 配了远程源时另有一层考虑：远程用量写在远端机上，本机 db 的 mtime
+   * 不会因远程的变化而动，fs.watch 永远不触发。所以远程源的刷新完全依赖
+   * 这个限频窗口 —— 不能因为"本机没写入"就把间隔拉长，否则远程那段
+   * 数字会长时间不更新。这里在配了远程源时用 activity_min_ms 作为下限，
+   * 不因本机空闲而放宽到 idle_push_ms。 */
   const now = Date.now();
   const st = dbStamp();
   const fresh = st && st !== lastStamp;
-  const wait = fresh
+  const remote = hasRemote(cfg);
+  let wait = fresh
     ? Math.max(2000, cfg.activity_min_ms | 0 || 8000)
     : Math.max(1500, cfg.idle_push_ms | 0 || 4000);
+  if (remote && !fresh) {
+    wait = Math.max(wait, Math.max(2000, cfg.activity_min_ms | 0 || 8000));
+  }
 
   if (now - lastSpawn < wait) {
     /* 限频未到：安排补拉，保证窗口内最后一笔写入一定被取到。 */
@@ -304,8 +339,13 @@ function watchDb() {
 
 /* ---------------------------------------------------------------- 启动 */
 
+const ZDU_REMOTE = path.join(HERE, "zdu.py");   // 部署到远端执行的那份
+const ZDU_AGG = path.join(HERE, "zdu_aggregate.py");
+const ZDU_REMOTE_LIB = path.join(HERE, "zdu_remote.py");
+
 let overlayMtimeKnown = false;
 let zduMtime = 0;
+let zduAuxMtime = 0;
 setInterval(() => {
   const cfg = readCfgCached();
   if (cfg.hot_reload === false) return;
@@ -313,17 +353,55 @@ setInterval(() => {
   try {
     const m = fs.statSync(ZDU).mtimeMs;
     if (overlayMtimeKnown && m !== zduMtime && pyRes) {
-      LOG("zdu.py changed, restarting resident python");
+      LOG("zdu_multi.py changed, restarting resident python");
       killResidentForUpgrade();
     }
     zduMtime = m;
     overlayMtimeKnown = true;
   } catch (e) { }
+  /* 远端脚本与合并逻辑的改动也要能生效。
+   * zdu.py 是部署到远端执行的那份 —— 它变了要重启常驻进程（下次取数会
+   * 重新部署到远端）；zdu_aggregate.py / zdu_remote.py 只影响本地编排，
+   * 同样需要重启才加载新代码。 */
+  try {
+    let aux = 0;
+    for (const f of [ZDU_REMOTE, ZDU_AGG, ZDU_REMOTE_LIB]) {
+      try { aux = Math.max(aux, fs.statSync(f).mtimeMs); } catch (e) { }
+    }
+    if (overlayMtimeKnown && aux !== zduAuxMtime && pyRes) {
+      LOG("remote/aggregate module changed, restarting resident python");
+      killResidentForUpgrade();
+    }
+    zduAuxMtime = aux;
+  } catch (e) { }
 }, 2000);
 
 /* 心跳兜底：fs.watch 事件不保证送达（Node 官方文档），无写入时也要能刷新"今天"
- * 的跨零点与时长。 */
-setInterval(maybeSpawn, Math.max(4000, readCfg().heartbeat_ms | 0 || 6000));
+ * 的跨零点与时长。
+ *
+ * 配了远程源时，心跳是刷新远程用量的唯一途径（远端写入不改变本机 db 的
+ * mtime），所以间隔取配置值与 6s 中的较小者 —— 配了远程源就按 6s 心跳，
+ * 否则沿用用户设的 heartbeat_ms（默认 60s）。 */
+let currentHeartbeat = 0;
+let heartbeatTimer = null;
+function heartbeatMs() {
+  const cfg = readCfgCached();
+  const configured = Math.max(4000, cfg.heartbeat_ms | 0 || 6000);
+  return hasRemote(cfg) ? Math.min(configured, 6000) : configured;
+}
+currentHeartbeat = heartbeatMs();
+heartbeatTimer = setInterval(maybeSpawn, currentHeartbeat);
+/* 配置改了（新增远程源）要重新设定心跳间隔 —— setInterval 的间隔不能改，
+ * 所以拆掉重建。 */
+setInterval(() => {
+  const want = heartbeatMs();
+  if (want !== currentHeartbeat) {
+    currentHeartbeat = want;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(maybeSpawn, want);
+    LOG("heartbeat interval ->", want, "ms");
+  }
+}, 5000);
 
 const hook = (wc) => {
   if (!isMainWindowState(wc)) return;

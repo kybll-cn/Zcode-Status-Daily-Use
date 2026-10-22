@@ -30,8 +30,11 @@ from pathlib import Path
 from typing import NoReturn
 
 PLUGIN_NAME = "Zcode-Status-Daily-Use"
-PLUGIN_VERSION = "1.1.0"
-PLUGIN_FILES = ("inject-main.cjs", "overlay.js", "zdu.py")
+PLUGIN_VERSION = "1.2.0"
+# zdu_multi.py 是本地编排入口（多源合并），zdu.py 是部署到远端执行的那份，
+# zdu_remote.py 是通道实现，zdu_aggregate.py 是合并口径。
+PLUGIN_FILES = ("inject-main.cjs", "overlay.js", "zdu.py",
+                "zdu_multi.py", "zdu_remote.py", "zdu_aggregate.py")
 INJECT_MARKER = "[zdaily] load failed"
 
 # 匹配本安装器写入的注入行（整行删除，重复安装不会叠加）。
@@ -49,6 +52,12 @@ DEFAULT_CONFIG = {
     "resident": True,
     "include_subagent": True,
     "lang": "zh",
+    "local_label": "本机",
+    # 远程源：空列表 = 只看本机。配了就跨机取数并合并。
+    # 形如 {"kind":"wsl","distro":"Ubuntu-24.04","user":"kybll"}
+    #   或 {"kind":"ssh","host":"1.2.3.4","user":"root"}
+    #   或 {"kind":"docker","container":"zcode-agent"}
+    "remote_sources": [],
 }
 
 
@@ -348,7 +357,7 @@ def find_src_dir() -> Path:
     if (here / "inject-main.cjs").is_file():
         return here
     fail("插件文件不完整：源码目录里找不到 inject-main.cjs\n  " + str(here) +
-         "\n请确认 install.py 与 inject-main.cjs / overlay.js / zdu.py 在同一目录。")
+         "\n请确认 install.py 与 " + " / ".join(PLUGIN_FILES) + " 在同一目录。")
 
 
 def copy_plugin_files(src_dir: Path, dest_dir: Path) -> None:

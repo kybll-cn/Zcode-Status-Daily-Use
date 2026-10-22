@@ -15,6 +15,19 @@ ZCode 设置→用量 页面在同一天同一区间下必然一致。
      input 内），不是 provider 报的 total，与客户端 summary.totalTokens 同源。
 
 只 SELECT，不写库；优先只读连接，WAL/shm 不可用时退回普通连接。
+
+-------------------------------------------------- 多源（远程）聚合
+客户端的用量由「发起模型请求的那个进程」写进自己持有的 db。远程 agent 在
+远端跑，用量就落在远端的库；本机 db 里永远没有那段数据，而客户端的
+getAppUsageStats 只查活动 workspace 那一个 client，没有跨机聚合。
+
+所以「今天」在本插件里定义为**本机日历日的一个绝对时间窗**，并把这个窗
+连同同一个时区偏移一起交给远端去查：远端按完全相同的口径分桶、返回，
+本地只需逐项相加即可合并。这也避免了「各按各自本地日切分再对齐」的
+跨时区错位问题。
+
+远端执行的是本文件的副本（zdu_remote.py 负责部署），远端那一侧永远走
+单源模式（--single），不会递归去拉别的远端。
 """
 from __future__ import annotations
 
@@ -142,8 +155,12 @@ def fmt(n, lang: str = "zh") -> str:
 
 # ---------------------------------------------------------------- 主聚合
 
-def daily_snapshot(cfg: dict | None = None) -> dict:
+def daily_snapshot(cfg: dict | None = None, window: dict | None = None) -> dict:
     """产出「今天」的小时级用量快照。
+
+    window: 可选的外部时间窗 {"startMs", "endMs", "tzOffsetMs"}。
+      传了就用它，不再按本机当前时间重算日界 —— 远端执行时走这条路，
+      以保证各源落在同一个绝对时间窗、同一组分桶上。
 
     返回结构：
       {
@@ -167,8 +184,15 @@ def daily_snapshot(cfg: dict | None = None) -> dict:
     include_sub = cfg.get("include_subagent", True) is not False
     now = int(time.time() * 1000)
     time_zone = os.environ.get("TZ") or _system_tz()
-    tz = tz_offset_ms(time_zone, now)
-    day_start = local_day_start_ms(now, tz)
+
+    if window:
+        # 外部给定窗口：起止与时区偏移都由调用方定，保证多源同一口径。
+        day_start = int(window["startMs"])
+        now = int(window["endMs"])
+        tz = int(window["tzOffsetMs"])
+    else:
+        tz = tz_offset_ms(time_zone, now)
+        day_start = local_day_start_ms(now, tz)
 
     empty = {
         "ok": True, "error": None, "generatedAt": now, "timeZone": time_zone,
@@ -412,6 +436,11 @@ def serve() -> None:
 
     每次请求新开连接，不持长读事务，WAL checkpoint 不受阻（与 TypeBar 同思路）。
     EOF = 上游退出，随即退出，孤儿进程自清理。
+
+    请求行可以是纯文本，也可以是 JSON：
+      {"window": {"startMs":…, "endMs":…, "tzOffsetMs":…}}
+    带 window 的是远端执行场景 —— 远端按调用方给的同一时间窗查，
+    保证多源落在同一组分桶上。
     """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -422,8 +451,20 @@ def serve() -> None:
         line = sys.stdin.readline()
         if not line:
             return
+        line = line.strip()
+        if not line:
+            continue
+        window = None
+        if line.startswith("{"):
+            # JSON 请求行：只取 window，其余字段本版不使用。
+            try:
+                req = json.loads(line)
+                if isinstance(req, dict) and isinstance(req.get("window"), dict):
+                    window = req["window"]
+            except Exception:
+                window = None
         try:
-            out = json.dumps(daily_snapshot(cfg), ensure_ascii=True)
+            out = json.dumps(daily_snapshot(cfg, window=window), ensure_ascii=True)
         except Exception as e:
             out = json.dumps({"ok": False, "error": str(e)[:300]})
         sys.stdout.write(out + "\n")
@@ -443,8 +484,8 @@ def _console_utf8(stream=None) -> None:
             pass
 
 
-def render_text(cfg: dict) -> str:
-    s = daily_snapshot(cfg)
+def render_text(cfg: dict, window: dict | None = None) -> str:
+    s = daily_snapshot(cfg, window=window)
     if not s.get("ok"):
         return "读取失败: " + str(s.get("error"))
     z = s["summary"]
@@ -467,13 +508,25 @@ def render_text(cfg: dict) -> str:
 def main(argv) -> None:
     _console_utf8()
     cfg = load_config()
-    cmd = argv[0] if argv else "text"
+    args = list(argv or [])
+    cmd = args[0] if args else "text"
+
+    # --window <json>：远端执行时由调用方给定时间窗，保证与本机同一组分桶。
+    window = None
+    if "--window" in args:
+        i = args.index("--window")
+        if i + 1 < len(args):
+            try:
+                window = json.loads(args[i + 1])
+            except Exception:
+                window = None
+
     if cmd == "serve":
         serve()
     elif cmd == "json":
-        print(json.dumps(daily_snapshot(cfg), ensure_ascii=True))
+        print(json.dumps(daily_snapshot(cfg, window=window), ensure_ascii=True))
     else:
-        print(render_text(cfg))
+        print(render_text(cfg, window=window))
 
 
 if __name__ == "__main__":

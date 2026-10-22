@@ -11,11 +11,26 @@ const src = fs.readFileSync(path.join(__dirname, "..", "inject-main.cjs"), "utf8
 const checks = [
   ["有 idle_push_ms 配置项", /idle_push_ms/.test(src)],
   ["心跳默认 6000", /heartbeat_ms: 6000/.test(src)],
-  ["心跳下限 4000", /Math\.max\(4000, readCfg\(\)\.heartbeat_ms/.test(src)],
+  /* 心跳下限 4000 —— 早先写在 setInterval 里，现在抽成了 heartbeatMs()，
+   * 断言跟着改，但下限值不能变。 */
+  ["心跳下限 4000", /Math\.max\(4000, cfg\.heartbeat_ms/.test(src)],
   ["无新写入不再直接 return", !/const st = dbStamp\(\);\s*\n\s*if \(st && st === lastStamp\) return;/.test(src)],
   ["按 fresh 分支选限频", /const fresh = st && st !== lastStamp;/.test(src)],
   ["热更新后重置时间戳", /lastStamp = 0;/.test(src)],
   ["overlay 走 maybeSpawn 补拉", /scheduleRetry\(400\)/.test(src)],
+  /* 远程源相关：配了远程源时限频不因本机空闲而放宽 */
+  ["有远程源时用 activity_min_ms 兜底", /if \(remote && !fresh\)/.test(src)],
+  ["远程源存在性判定", /function hasRemote\(/.test(src)],
+  ["远程源时心跳更密", /hasRemote\(cfg\) \? Math\.min\(configured, 6000\)/.test(src)],
+  /* 协议：serve 跳过空行，主进程必须写非空行。
+   * 早先版本写的是 "\n"，serve 那边当成"没有请求"跳过，
+   * 主进程就永远等不到结果 —— 表现为卡片一直"等待数据…"。 */
+  ["serve 请求行非空", /stdin\.write\("q\\n"\)/.test(src)],
+  ["没有写空行请求", !/stdin\.write\("\\n"\)/.test(src)],
+  /* 多源入口：常驻进程跑的是 zdu_multi.py */
+  ["常驻进程用 zdu_multi.py", /ZDU = path\.join\(HERE, "zdu_multi\.py"\)/.test(src)],
+  /* 超时要按远程源数量放宽 */
+  ["超时按远程源放宽", /15000 \+ remoteCount \* 25000/.test(src)],
 ];
 
 let ok = true;

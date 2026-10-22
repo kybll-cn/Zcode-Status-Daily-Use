@@ -42,7 +42,7 @@
     document.querySelectorAll(".zdu-root").forEach(function (el) { el.remove(); });
   } catch (e) { }
 
-  var state = { data: null, lang: "zh", mounted: false };
+  var state = { data: null, lang: "zh", mounted: false, renderedKey: "" };
 
   function L(zh, en) { return state.lang === "en" ? en : zh; }
   function ls(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } }
@@ -358,6 +358,43 @@
     return lg;
   }
 
+  /* 来源分区：每个数据源一行，条形长度 = 该源 token 占合计的比例。
+   * 取数失败的源单独标红并显示原因 —— 远端连不上时看板要看得见，
+   * 而不是假装那个源没有用量。 */
+  function buildSources(sources, d) {
+    var wrap = el("div", "zdu-srcs");
+    var total = 0;
+    sources.forEach(function (s) {
+      if (s && s.ok !== false) total += s.totalTokens || 0;
+    });
+    if (!total) total = 1;
+    sources.forEach(function (s) {
+      if (!s) return;
+      var row = el("div", "zdu-src-row");
+      var nm = el("span", "zdu-src-name", s.source || "?");
+      nm.title = s.source || "";
+      row.appendChild(nm);
+      if (s.ok === false) {
+        var err = el("span", "zdu-src-err", L("不可用：", "unavailable: ") + (s.error || "?"));
+        err.title = s.error || "";
+        row.appendChild(err);
+      } else {
+        var track = el("div", "zdu-src-track");
+        var fill = el("i", "zdu-src-fill");
+        fill.style.width = (((s.totalTokens || 0) / total) * 100).toFixed(1) + "%";
+        fill.style.background = s.source === (d.localLabel || "本机")
+          ? "var(--color-usage-chart-1, #5b8ff9)"
+          : "var(--color-usage-chart-2, #61d9a6)";
+        track.appendChild(fill);
+        row.appendChild(track);
+        row.appendChild(el("span", "zdu-src-val",
+          fmt(s.totalTokens) + " · " + (s.requests || 0) + L("次", "req")));
+      }
+      wrap.appendChild(row);
+    });
+    return wrap;
+  }
+
   function shortModel(id) {
     if (!id) return "?";
     var s = String(id);
@@ -378,6 +415,7 @@
       card0.appendChild(el("div", "zdu-empty-t",
         d && d.error ? (L("读取失败：", "Failed: ") + d.error) : L("等待数据…", "Waiting for data…")));
       host.appendChild(card0);
+      state.renderedKey = dataKey(d);
       return;
     }
 
@@ -402,6 +440,19 @@
       (s.activeHours || 0) + "/24",
       s.firstAt ? (hhmm(s.firstAt) + " – " + hhmm(s.lastAt)) : ""));
     card.appendChild(row);
+
+    /* ---- 来源分区（本地 + 远程）----
+     * 只有存在远程源时才显示。远程用量不在本机库里，客户端也不会汇总，
+     * 所以这一块是插件自己跨机取数后合并的结果。 */
+    var srcs = d.sources || [];
+    var remoteSrcs = srcs.filter(function (x) {
+      return x && x.source && x.source !== (d.localLabel || "本机");
+    });
+    if (remoteSrcs.length) {
+      card.appendChild(el("div", "zdu-sec-t",
+        L("来源（本地 + 远程）", "Sources (local + remote)")));
+      card.appendChild(buildSources(srcs, d));
+    }
 
     /* ---- 24 小时分布 ---- */
     card.appendChild(el("div", "zdu-sec-t", L("24 小时分布（按模型堆叠）", "24-hour distribution (stacked by model)")));
@@ -469,6 +520,9 @@
       (s.toolErrors ? L(" · 失败 ", " · err ") + s.toolErrors : "")));
     card.appendChild(foot);
 
+    /* 记录本次渲染的内容指纹，下一次 tick 据此判断要不要重绘。 */
+    state.renderedKey = dataKey(d);
+
     /* 卡片已在上方 appendChild 到 host（为了量宽度），这里不再重复挂载。 */
   }
 
@@ -515,7 +569,14 @@
     ".zdu-val{flex:0 0 auto;font-size:11px;color:var(--color-foreground-subtle,inherit);font-variant-numeric:tabular-nums}",
     ".zdu-sub{display:block;margin-top:1px;font-size:11px;color:var(--color-foreground-subtle,inherit);opacity:.8;font-variant-numeric:tabular-nums}",
     ".zdu-foot{display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between;margin-top:16px;padding-top:12px;border-top:1px solid var(--color-border,rgba(127,127,127,.15));font-size:11px;color:var(--color-foreground-subtle,inherit)}",
-    ".zdu-empty-t{padding:20px 0;text-align:center;font-size:12px;color:var(--color-foreground-subtle,inherit)}"
+    ".zdu-empty-t{padding:20px 0;text-align:center;font-size:12px;color:var(--color-foreground-subtle,inherit)}",
+    ".zdu-srcs{margin-top:16px;padding-top:12px;border-top:1px solid var(--color-border,rgba(127,127,127,.15))}",
+    ".zdu-src-row{display:flex;align-items:center;gap:8px;padding:3px 0}",
+    ".zdu-src-name{flex:0 0 auto;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--color-foreground,inherit)}",
+    ".zdu-src-track{flex:1 1 auto;min-width:40px;height:6px;border-radius:3px;background:var(--color-surface-secondary,rgba(127,127,127,.12));overflow:hidden}",
+    ".zdu-src-fill{display:block;height:100%;border-radius:3px}",
+    ".zdu-src-val{flex:0 0 auto;font-size:11px;color:var(--color-foreground-subtle,inherit);font-variant-numeric:tabular-nums}",
+    ".zdu-src-err{flex:0 0 auto;font-size:11px;color:var(--color-danger,#d9534f);opacity:.9;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
   ].join("");
 
   function injectStyle() {
@@ -534,6 +595,34 @@
   /* 设置页是客户端路由切出来的，DOM 会整体重挂。用 MutationObserver 盯 body：
    * 目标不在就挂上，目标消失就摘掉（切走设置时不留残影）。 */
   var lastTick = 0;
+  /* 上次渲染的内容指纹。用来判断"数据变了没有"——
+   * 变了才重绘，避免每 2 秒无谓地重建一次 SVG。
+   *
+   * 指纹只取**内容**，不取时间戳：主进程每次推送都会带新的 generatedAt，
+   * 用时间戳当 key 会导致每轮心跳都重绘，既费 CPU 又让动画闪。
+   *
+   * 这个 key 是 v1.1 补的：原先 tick() 的重绘条件是 `!state.data`
+   * （只在没数据时渲染），数据推到了画面也不更新。 */
+  function dataKey(d) {
+    if (!d) return "";
+    var s = d.summary || {};
+    var parts = [
+      s.totalTokens || 0, s.requests || 0, s.totalTurns || 0,
+      s.cacheReadTokens || 0, s.toolCalls || 0, s.activeHours || 0,
+      s.mainTokens || 0, s.subTokens || 0,
+    ];
+    var h = d.hourly || [];
+    for (var i = 0; i < h.length; i++) parts.push(h[i].totalTokens || 0);
+    var ms = d.models || [];
+    for (var j = 0; j < ms.length; j++) parts.push(ms[j].totalTokens || 0);
+    var ss = d.sessions || [];
+    for (var k = 0; k < ss.length; k++) parts.push(ss[k].totalTokens || 0);
+    var src = d.sources || [];
+    for (var m = 0; m < src.length; m++) {
+      parts.push(src[m].source, src[m].totalTokens || 0, src[m].ok === false ? 1 : 0);
+    }
+    return parts.join(",");
+  }
   function tick() {
     if (stale()) return;
     var now = Date.now();
@@ -544,7 +633,7 @@
     var cur = document.querySelector(".zdu-root");
     if (here) {
       if (!cur || !cur.isConnected) mountHost();
-      else if (!state.data) render();
+      else if (!state.data || dataKey(state.data) !== state.renderedKey) render();
     } else if (cur) {
       cur.remove();
       state.mounted = false;
@@ -587,6 +676,13 @@
     tick();
     /* 数据到了但页面还没判定为用量页，下一次 tick 会挂载 */
     if (isSettingsUsagePage() && !document.querySelector(".zdu-root")) mountHost();
+    /* 已经在用量页且数据有变化：立刻重绘，不等下一次 2 秒心跳。
+     * tick() 内部有 400ms 节流，刚推完数据的那次 tick 很可能被节流挡掉，
+     * 这里直接调 render() 补上 —— 否则新数据要等最多 2 秒才出现在屏幕上。 */
+    else if (state.renderedKey !== dataKey(payload)) {
+      var cur = document.querySelector(".zdu-root");
+      if (cur && cur.isConnected) render();
+    }
   };
 
   /* ---------------------------------------------------------------- 启动 */
