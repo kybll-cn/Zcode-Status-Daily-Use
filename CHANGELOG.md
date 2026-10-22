@@ -2,6 +2,50 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0]
+
+### 新增
+
+- **自动发现客户端已配置的远程连接，不再手填、不再写密码。**
+  v1.2.0 需要用户在 `config.json` 里手写 `remote_sources`，SSH 还得自己解决认证
+  （`ssh.exe` 不接受命令行密码，也没法用 `BatchMode` 走密码）。
+  现在插件直接读客户端自己的配置：
+
+  - **连接档案**：`~/.zcode/v2/setting.json` 的 `connectionProfiles` ——
+    用户在客户端里配过的 SSH / WSL / Docker 远程，插件自动跟上。
+  - **凭证**：`~/.zcode/v2/credentials.json` —— 按客户端的加密格式
+    （AES-256-GCM，密钥 = `sha256(ZCODE_CREDENTIAL_SECRET)`，
+    没有该环境变量时回退到 `zcode-credential-fallback:<platform>:<home>:<username>`）
+    自己解密。**密码不落插件配置、不出现在任何地方。**
+
+  结果是：客户端里加一个远程连接，插件下次取数就自动带上，不用改任何配置。
+
+- **SSH 通道用客户端自带的 ssh2 库**（在 `app.asar` 的 `node_modules/ssh2` 里），
+  不引入任何新依赖、不要求用户装 `sshpass` 或配免密。
+  与客户端的 `SSHBackend` 用的是同一个库，行为一致（支持密码与私钥）。
+
+### 改变
+
+- **远程通道整体挪到主进程**（新增 `zdu_remote_main.cjs`）。
+  原来在 Python 侧用 `ssh.exe` / `wsl.exe` / `docker exec`；现在主进程统一负责
+  远程（它才有 ssh2 与客户端凭证），Python 只管本地查询与合并。
+  主进程取好的快照连同时间窗一起发给 Python（JSON 请求行），
+  Python 侧那条独立实现保留，作为**不依赖客户端**的独立可用路径。
+- **SSH 连接复用**：一次取数跑好几条命令（探 home、查 sha256、传脚本、跑取数），
+  原来每条命令重连一次。改成一条连接跑完全流程，
+  实测跨境网络从 11.8s 降到 3.4s。
+- **探库与校验合并成一条命令**（省一次 SSH 往返）。
+
+### 修复
+
+- **同一个源被算两遍。** 主进程自动发现的 WSL 与 Python 侧自己取的那个同名，
+  合计里出现了两个 WSL。现在由主进程统一提供远程快照，Python 侧不再重复取；
+  合并层也加了同名源去重作为最后一道防线。
+- **远端路径重复拼接**：把 `"$HOME/..."` 当字面量路径再切分拼回，出现
+  `$HOME/a/$HOME/a/zdu.py`。现在探库时直接拿远端 home 的**绝对路径**。
+
+---
+
 ## [1.2.0]
 
 ### 新增

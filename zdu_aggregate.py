@@ -58,6 +58,19 @@ def merge(snapshots: list[dict]) -> dict:
         return {"ok": True, "error": None, "summary": {}, "hourly": [],
                 "models": [], "sessions": [], "tools": [], "sources": []}
 
+    # 源去重：同一个 source 只算一次。
+    # 曾真的发生过 —— 主进程自动发现的 WSL 与 Python 自己取的那个同名，
+    # 结果这个源在合计里算了两遍。合并层做最后一道防线：
+    # 同名源保留先到的那个（先到的是主进程给的，更权威）。
+    deduped = []
+    seen_src = set()
+    for s, d in items:
+        if s in seen_src:
+            continue
+        seen_src.add(s)
+        deduped.append((s, d))
+    items = deduped
+
     # ---- 时间窗与元信息 ----
     first = items[0][1]
     out = {

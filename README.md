@@ -106,16 +106,16 @@ uninstall.bat
   ├ fs.watch db 目录 ──┐                ├ 挂在原生用量区之后
   ├ 心跳兜底 ──────────┤                ├ MutationObserver 跟随路由切换
   │                    ↓                └ window.__zduUpdate(payload)
-  └ 常驻 python zdu_multi.py ←──────────── 渲染
-     (stdin/stdout 行协议)                  
-     ├ 本地：zdu.py 读本机 db
-     └ 远程：zdu_remote.py 送脚本 + 取数
-              └ 远端 zdu.py 读远端 db
+  ├ 远程：zdu_remote_main.cjs ←───────────── 渲染
+  │   （ssh2 + 客户端凭证，自动发现档案）
+  └ 本地+合并：zdu_multi.py
+       ├ 本地：zdu.py 读本机 db
+       └ 合并：zdu_aggregate.py
 ```
 
 - **零空闲开销**：`fs.watch` 监听 db 写入（去抖 300ms）+ 心跳兜底；没有写入且没有窗口时不取数。
 - **常驻查询**：python 进程常驻，省掉每次 60–100ms 的解释器启动开销；崩溃自动重启，30 秒内连续 3 次判不稳定则回退一次性 spawn。
-- **热更新**：`overlay.js` / `zdu*.py` 改动后 mtime 触发重注入，无需重启客户端。`overlay.js` 载入前经 `new Function` 语法校验，避免载入写到一半的文件。
+- **热更新**：`overlay.js` / `zdu*.py` / `zdu_remote_main.cjs` 改动后 mtime 触发重注入，无需重启客户端。`overlay.js` 载入前经 `new Function` 语法校验，避免载入写到一半的文件。
 - **限频**：默认 8s 一次（`activity_min_ms`），窗口内最后一笔写入一定补拉。
 - **配了远程源时**：心跳自动收到 6s，限频不再因「本机没写入」而放宽 ——
   远端写入不改变本机 db 的 mtime，`fs.watch` 永远不触发，刷新只能靠心跳。
@@ -132,40 +132,55 @@ uninstall.bat
 所以本插件自己跨机取数再合并。配好远程源后，「今日用量」里的合计、24 小时分布、
 按模型、按会话都是**本地 + 远程**的合并结果。
 
-### 配置
+### 自动发现（默认开启）
 
-`config.json` 里加 `remote_sources`：
+**在客户端里配过的远程，插件自动跟上 —— 不用改任何配置。**
+
+插件直接读客户端自己的两份文件：
+
+| 读什么 | 从哪读 | 用来做什么 |
+| --- | --- | --- |
+| 连接档案 | `~/.zcode/v2/setting.json` 的 `connectionProfiles` | 知道有哪些远程（SSH / WSL / Docker）、地址、端口、用户名 |
+| 凭证 | `~/.zcode/v2/credentials.json` | SSH 密码 —— 按客户端的加密格式自己解密 |
+
+所以：**客户端里新增一个远程连接，插件下次取数就自动带上。**
+密码不写在插件的配置里，也不出现在任何地方。
+
+SSH 用的是**客户端自带的 ssh2 库**（在 `app.asar` 的 `node_modules/ssh2` 里），
+不引入新依赖，也不需要你装 `sshpass` 或配免密 —— 客户端是怎么认证的，插件就怎么认证。
+
+### 手动补充（可选）
+
+自动发现覆盖不到的（比如客户端里没配档案的机器），可以写在 `config.json`：
 
 ```json
 {
   "local_label": "本机",
+  "discover_remote": true,
+  "remote_timeout_ms": 25000,
   "remote_sources": [
-    { "kind": "wsl", "distro": "Ubuntu-24.04", "user": "kybll" },
     { "kind": "ssh", "host": "1.2.3.4", "user": "root", "port": 22 },
+    { "kind": "wsl", "distro": "Ubuntu-24.04", "user": "kybll" },
     { "kind": "docker", "container": "zcode-agent" }
   ]
 }
 ```
 
-每个源可选：
-
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `kind` | — | `wsl` / `ssh` / `docker` |
-| `label` | 自动 | 卡片上显示的名字，如 `WSL:Ubuntu-24.04` |
-| `timeout` | `20` | 单次调用超时秒数 |
-| `python` | `python3` | 远端解释器 |
-| `home` | `$HOME` | 远端 home（必须是绝对路径） |
-| `enabled` | `true` | 设 `false` 则跳过这个源 |
+| `discover_remote` | `true` | 是否自动发现客户端的连接档案 |
+| `remote_timeout_ms` | `25000` | 单个远程源的超时秒数 |
+| `remote_sources` | `[]` | 手动补充的源；自动发现覆盖不到、又确实要连的才写这里 |
 
-改完配置**不用重启 ZCode** —— 插件每 2 秒重读一次配置。
+手动源里可以写 `password`（明文，不推荐）、`privateKeyPath`；
+不写就沿用客户端档案里的凭证。
 
 ### 要求
 
 - 远端要有 `python3` 和 `sqlite3`（绝大多数 Linux 发行版自带）；
-- SSH 要配好免密（插件用 `BatchMode=yes`，不会卡在密码提示上）；
-- Docker 要能 `docker exec`；
-- WSL 用 `wsl.exe -d <发行版> -u <用户>`，Windows 侧要能调到 `wsl.exe`。
+- 远端 agent 要真的跑过会话 —— 远端库里才会有数据
+  （`~/.zcode/cli/db/db.sqlite`，客户端自己也在这个路径建）；
+- SSH 走客户端的档案时，认证方式与客户端一致（密码或私钥都行）。
 
 远端需要的脚本由插件自动部署到 `~/.zcode/zcode-status-daily-use/zdu.py`，
 比对 sha256，一致就不重传。远端库的查找顺序与客户端完全一致
@@ -178,6 +193,7 @@ uninstall.bat
   代价是「今天」以本机时区为准。
 - 合计、请求数等逐项相加；但**缓存命中率**与模型**占比**按合并后的分子分母重算，
   **活跃时段**按合并后的 24 个桶重算（各源相加会把同一时段重复计）。
+- 同一个源只算一次（同名源去重）。
 - 某个源取数失败不影响其它源 —— 卡片上那个源会标红并显示失败原因，
   不会假装它没有用量。
 
@@ -207,7 +223,9 @@ uninstall.bat
 | `lang` | `"zh"` | `zh` / `en` |
 | `python_path` | 自动 | 安装时写入当前 Python 路径 |
 | `local_label` | `"本机"` | 本地源在「来源」分区里的显示名 |
-| `remote_sources` | `[]` | 远程源列表，见上文「远程任务」 |
+| `discover_remote` | `true` | 自动发现客户端里已配置的远程连接档案 |
+| `remote_timeout_ms` | `25000` | 单个远程源的超时秒数 |
+| `remote_sources` | `[]` | 手动补充的远程源，见上文「远程任务」 |
 
 > **改 `inject-main.cjs` 必须重启 ZCode** —— 它是主进程代码，在启动时加载一次；
 > 只有 `overlay.js` 会被热更新。
@@ -265,8 +283,10 @@ node tests/render_remote_test.js % 来源分区渲染、数据变化重绘
   远端的凌晨时段会落在本机时间轴的对应位置，而不是远端自己的自然日。
 - **远程源只在远端 agent 真的跑过会话后才有数据。** 远端还没建过
   `~/.zcode/cli/db/db.sqlite` 时，那个源会显示「不可用」，这是正常的。
+- **自动发现只认客户端「活跃」的连接档案**（`lifecycleState` 不是 `retired`）。
+  客户端里被标记为已退役的档案不会去连。
 - 远程源不支持 `server`（ZCode 自家 server）形态 —— 那条路要研究 ZCode server
-  的控制协议，当前只做了 `wsl` / `ssh` / `docker` 三种。
+  的控制协议，当前只做了 `ssh` / `wsl` / `docker` 三种。
 
 ---
 

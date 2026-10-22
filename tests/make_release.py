@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "Zcode-Status-Daily-Use"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 FILES = [
     ".gitattributes",
@@ -28,6 +28,7 @@ FILES = [
     "zdu_multi.py",
     "zdu_remote.py",
     "zdu_aggregate.py",
+    "zdu_remote_main.cjs",
 ]
 
 DIRS = ["docs", "tests"]

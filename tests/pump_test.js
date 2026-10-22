@@ -24,13 +24,22 @@ const checks = [
   ["远程源时心跳更密", /hasRemote\(cfg\) \? Math\.min\(configured, 6000\)/.test(src)],
   /* 协议：serve 跳过空行，主进程必须写非空行。
    * 早先版本写的是 "\n"，serve 那边当成"没有请求"跳过，
-   * 主进程就永远等不到结果 —— 表现为卡片一直"等待数据…"。 */
-  ["serve 请求行非空", /stdin\.write\("q\\n"\)/.test(src)],
+   * 主进程就永远等不到结果 —— 表现为卡片一直"等待数据…"。
+   * v1.3 起请求行是 JSON（带 window 与 remote 快照）。 */
+  ["serve 请求行非空", /stdin\.write\(req \+ "\\n"\)/.test(src)],
   ["没有写空行请求", !/stdin\.write\("\\n"\)/.test(src)],
   /* 多源入口：常驻进程跑的是 zdu_multi.py */
   ["常驻进程用 zdu_multi.py", /ZDU = path\.join\(HERE, "zdu_multi\.py"\)/.test(src)],
   /* 超时要按远程源数量放宽 */
   ["超时按远程源放宽", /15000 \+ remoteCount \* 25000/.test(src)],
+
+  /* ---- v1.3.0：远程通道在主进程，自动发现客户端档案 ---- */
+  ["引入主进程远程通道模块", /require\(path\.join\(HERE, "zdu_remote_main\.cjs"\)\)/.test(src)],
+  ["自动发现连接档案", /discoverProfiles\(\)/.test(src)],
+  ["主进程算统一时间窗", /function currentWindow\(\)/.test(src)],
+  ["远程快照并入请求", /req\.remote = remote/.test(src)],
+  ["runQuery 是异步的", /async function runQuery\(\)/.test(src)],
+  ["busy 由 runQuery 自己管", /if \(busy\) return;\s*\n\s*busy = true;/.test(src)],
 ];
 
 let ok = true;

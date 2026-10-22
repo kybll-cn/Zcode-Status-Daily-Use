@@ -67,11 +67,19 @@ def _local_window(cfg: dict) -> dict:
             "timeZone": time_zone}
 
 
-def collect(cfg: dict | None = None, window: dict | None = None) -> dict:
+def collect(cfg: dict | None = None, window: dict | None = None,
+            remote: list | None = None, remote_managed: bool = False) -> dict:
     """采一份多源合并快照。
 
     window 传了就用它当时间窗（各源都按这同一个窗口查）；
     不传则按本机当前时间算「今天」。
+
+    remote 传了就把它当作已经取好的远程快照（主进程用 ssh2 取的）直接并进来。
+
+    remote_managed 为真时**不再自己取远程** —— 远程一律由主进程提供。
+    主进程能拿到 ssh2 与客户端凭证，自己取更靠谱；两边都取会把同一个源
+    算两遍（曾真的发生过：WSL 源在结果里出现两次）。
+    只有单独在命令行跑 zdu_multi.py（没有主进程）时才自己取。
     """
     cfg = cfg or zdu.load_config()
     if not window:
@@ -96,21 +104,36 @@ def collect(cfg: dict | None = None, window: dict | None = None) -> dict:
     except Exception as e:
         errors.append({"source": local_label, "error": f"{type(e).__name__}: {e}"})
 
-    # ---- 远程 ----
-    for src in _remote_sources(cfg):
-        label = src.get("label") or zdu_remote.source_label(src)
-        timeout = int(src.get("timeout") or DEFAULT_TIMEOUT)
-        try:
-            remote = zdu_remote.snapshot(src, timeout=timeout, window=window)
-            if remote.get("ok") is False:
-                errors.append({"source": label,
-                               "error": remote.get("error") or "remote error"})
-            else:
-                snapshots.append({"source": label, "snapshot": remote})
-        except zdu_remote.RemoteError as e:
-            errors.append({"source": label, "error": str(e)})
-        except Exception as e:
-            errors.append({"source": label, "error": f"{type(e).__name__}: {e}"})
+    # ---- 远程（主进程取好的）----
+    for item in (remote or []):
+        if not isinstance(item, dict):
+            continue
+        label = item.get("source") or "?"
+        snap = item.get("snapshot")
+        if isinstance(snap, dict) and snap.get("ok") is not False:
+            snapshots.append({"source": label, "snapshot": snap})
+        else:
+            errors.append({"source": label,
+                           "error": (snap or {}).get("error") or item.get("error")
+                           or "remote error"})
+
+    # ---- 远程（本进程自己取的）----
+    # 仅在「没有主进程接管」时走这条路 —— 否则同一个源会被算两遍。
+    if not remote_managed:
+        for src in _remote_sources(cfg):
+            label = src.get("label") or zdu_remote.source_label(src)
+            timeout = int(src.get("timeout") or DEFAULT_TIMEOUT)
+            try:
+                snap = zdu_remote.snapshot(src, timeout=timeout, window=window)
+                if snap.get("ok") is False:
+                    errors.append({"source": label,
+                                   "error": snap.get("error") or "remote error"})
+                else:
+                    snapshots.append({"source": label, "snapshot": snap})
+            except zdu_remote.RemoteError as e:
+                errors.append({"source": label, "error": str(e)})
+            except Exception as e:
+                errors.append({"source": label, "error": f"{type(e).__name__}: {e}"})
 
     merged = zdu_aggregate.merge(snapshots)
     merged["sources"] = merged.get("sources") or []
@@ -133,14 +156,15 @@ def serve() -> None:
 
     协议（与 zdu.py 的 serve 一致）：
       - **空行忽略**（心跳/保活不发查询）；
-      - 非空行 = 查一次多源快照。若该行是 JSON 且带 window 字段，
-        则按该时间窗查（远端执行场景）；
-      - JSON 行不带 window 时，等同普通查询。
+      - 非空行 = 查一次多源快照。若该行是 JSON，则可带：
+          window —— 指定时间窗（各源按同一窗口查）
+          remote —— 主进程已经取好的远程快照，直接并进来
+      - JSON 行不带这两个字段时，等同普通查询。
 
     主进程（inject-main.cjs）写入的是 "q\\n" —— 不能写空行，
     空行会被这里跳过，主进程就永远等不到结果。
 
-    每次请求都重新采一遍多源（本地 + 远程），因为远程数据随时在变。
+    每次请求都重新采一遍本地（远程由主进程提供），因为数据随时在变。
     """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -154,16 +178,25 @@ def serve() -> None:
         if not line.strip():
             continue
         window = None
+        remote = None
+        remote_managed = False
         s = line.strip()
         if s.startswith("{"):
             try:
                 req = json.loads(s)
-                if isinstance(req, dict) and isinstance(req.get("window"), dict):
-                    window = req["window"]
+                if isinstance(req, dict):
+                    if isinstance(req.get("window"), dict):
+                        window = req["window"]
+                    if isinstance(req.get("remote"), list):
+                        remote = req["remote"]
+                        # 主进程给了远程快照 → 远程由它接管，本进程不再自己取
+                        remote_managed = True
             except Exception:
                 window = None
         try:
-            out = json.dumps(collect(cfg, window=window), ensure_ascii=True)
+            out = json.dumps(collect(cfg, window=window, remote=remote,
+                                     remote_managed=remote_managed),
+                             ensure_ascii=True)
         except Exception as e:
             out = json.dumps({"ok": False, "error": str(e)[:300]})
         sys.stdout.write(out + "\n")

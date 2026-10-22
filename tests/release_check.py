@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "Zcode-Status-Daily-Use-v1.2.0.zip"
+ZIP = ROOT / "dist" / "Zcode-Status-Daily-Use-v1.3.0.zip"
 
 FAILED = []
 
@@ -40,6 +40,8 @@ with zipfile.ZipFile(ZIP) as z:
     check("含 zdu_multi.py", any(n.endswith("zdu_multi.py") for n in names))
     check("含 zdu_remote.py", any(n.endswith("zdu_remote.py") for n in names))
     check("含 zdu_aggregate.py", any(n.endswith("zdu_aggregate.py") for n in names))
+    check("含 zdu_remote_main.cjs",
+          any(n.endswith("zdu_remote_main.cjs") for n in names))
     check("含 docs/remote-notes.md",
           any(n.endswith("docs/remote-notes.md") for n in names))
     check("不含 config.json",
@@ -52,9 +54,12 @@ with zipfile.ZipFile(ZIP) as z:
     # 安装器能从一个干净的解压目录跑起来吗
     print("=== 安装器自检 ===")
     install_py = z.read("Zcode-Status-Daily-Use/install.py").decode("utf-8")
-    check("安装器版本号是 1.2.0", 'PLUGIN_VERSION = "1.2.0"' in install_py)
-    for f in ("zdu_multi.py", "zdu_remote.py", "zdu_aggregate.py"):
+    check("安装器版本号是 1.3.0", 'PLUGIN_VERSION = "1.3.0"' in install_py)
+    for f in ("zdu_multi.py", "zdu_remote.py", "zdu_aggregate.py",
+              "zdu_remote_main.cjs"):
         check(f"安装器会带上 {f}", f'"{f}"' in install_py)
+    check("默认开启自动发现",
+          '"discover_remote": True' in install_py)
 
 print()
 if FAILED:

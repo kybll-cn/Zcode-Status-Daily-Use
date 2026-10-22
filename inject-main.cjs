@@ -45,6 +45,11 @@ function readCfg() {
 /* 配了远程源时，本机 db 的 mtime 不再是可靠的触发条件 ——
  * 远程用量变化时本机什么都不会动，只能靠心跳。 */
 function hasRemote(cfg) {
+  if (cfg.discover_remote !== false) {
+    try {
+      if ((rem().discoverProfiles() || []).length) return true;
+    } catch (e) { /* 读不到档案就当没有 */ }
+  }
   return Array.isArray(cfg.remote_sources) && cfg.remote_sources.some(
     (s) => s && s.enabled !== false
   );
@@ -189,16 +194,13 @@ function killResidentForUpgrade() {
 }
 
 /* 回退：一次性 spawn（config.resident=false 或判不稳定时走） */
-function legacySpawn() {
+function legacySpawn(req) {
   const py = spawn(readCfg().python_path, [ZDU, "json"], { windowsHide: true });
   let out = "";
-  /* 有远程源时超时放宽（跨进程 + 可能跨网络）。 */
-  const remoteCount = (readCfg().remote_sources || []).filter(
-    (s) => s && s.enabled !== false).length;
   const killTimer = setTimeout(() => {
     LOG("query timeout, killing");
     try { py.kill(); } catch (e) { }
-  }, 15000 + remoteCount * 25000);
+  }, 30000);
   py.stdout.on("data", (d) => { out += d; });
   py.on("error", (e) => { clearTimeout(killTimer); busy = false; LOG("spawn failed:", e.message); });
   py.on("close", () => {
@@ -212,22 +214,46 @@ function legacySpawn() {
   });
 }
 
-function runQuery() {
+/* 构造发给 Python 的请求行。
+ * 窗口与远程快照一起给 —— Python 按同一窗口查本地，远程快照也是按同一窗口取的，
+ * 合并才不会错位。 */
+function buildRequest(remote) {
+  const w = currentWindow();
+  const req = { window: w };
+  if (remote && remote.length) req.remote = remote;
+  return JSON.stringify(req);
+}
+
+async function runQuery() {
+  /* busy 在这里设/清 —— runQuery 现在是异步的（要先取远程），
+   * 在调用方设 busy 会在 await 期间提前解锁，导致并发取数。 */
+  if (busy) return;
   busy = true;
   const done = (payload) => {
     busy = false;
     if (payload) handlePayload(payload);
   };
+
+  /* 先取远程（可能要跨网络，慢）。失败不阻塞 —— 远程快照里带 error，
+   * Python 那边照样合并，只是那个源显示不可用。 */
+  let remote = [];
+  try {
+    remote = await collectRemote(currentWindow());
+  } catch (e) {
+    LOG("远程取数异常:", e.message);
+    remote = [];
+  }
+
+  const req = buildRequest(remote);
+
   if (readCfgCached().resident !== false && pyFail < 3) {
     if (!pyRes) startResident();
     if (pyRes && pyRes.proc.stdin.writable) {
       const state = pyRes;
-      /* 超时要按「有无远程源」算：配了远程源时一次请求可能要跨进程、
-       * 甚至跨网络到远端机上，本地那 15s 不够，会把好端端的常驻进程反复打死
-       * （3 次早退就回退一次性 spawn，更慢）。
-       * 这里给 15s + 每个远程源 25s 的余量。 */
-      const remoteCount = (readCfgCached().remote_sources || []).filter(
-        (s) => s && s.enabled !== false).length;
+      /* 超时要按远程源数量算：配了远程源时一次请求可能要跨网络到远端机上，
+       * 本地那 15s 不够，会把好端端的常驻进程反复打死（3 次早退就回退一次性
+       * spawn，更慢）。 */
+      const remoteCount = remoteSources().length;
       const timeout = 15000 + remoteCount * 25000;
       const timer = setTimeout(() => {
         LOG("resident query timeout, restarting");
@@ -238,12 +264,112 @@ function runQuery() {
       state.waiters.push((payload) => { clearTimeout(timer); done(payload); });
       /* 请求行不能是空行 —— serve 那边把空行当作"没有请求"跳过
        * （那是 zdu.py 起的协议，保留它是为了兼容）。
-       * 这里统一用 "q" 表示"查一次"。 */
-      try { state.proc.stdin.write("q\n"); } catch (e) { }
+       * 这里统一用 JSON 请求行（带窗口与远程快照）。 */
+      try { state.proc.stdin.write(req + "\n"); } catch (e) { }
       return;
     }
   }
   legacySpawn();
+}
+
+/* ---------------------------------------------------------------- 远程通道 */
+
+let remoteMod = null;
+function rem() {
+  if (!remoteMod) {
+    try {
+      remoteMod = require(path.join(HERE, "zdu_remote_main.cjs"));
+    } catch (e) {
+      LOG("远程通道模块加载失败:", e.message);
+      remoteMod = { discoverProfiles: () => [], fetchSnapshot: async () => { throw new Error("远程通道不可用"); } };
+    }
+  }
+  return remoteMod;
+}
+
+/* 算出「今天」的绝对时间窗 —— 本地与各远端按同一个窗口查，合并才不会错位。
+ * 口径与客户端的 resolveAgentSessionDbPath / 时区分桶一致：
+ *   dayIndex = floor((now + tzOffsetMs) / 86400000)
+ *   dayStart = dayIndex * 86400000 - tzOffsetMs
+ * 时区偏移用 Intl.DateTimeFormat 取目标时区的墙上时间，与客户端 vai() 同构。 */
+function currentWindow() {
+  const now = Date.now();
+  let tz = 0;
+  try {
+    const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    /* 取目标时区此刻的年月日时分，算成"当作 UTC 的墙上时间"再减去 now 的 UTC 部分，
+     * 差值即该时刻的时区偏移（客户端 vai() 的算法）。 */
+    const p = new Intl.DateTimeFormat("en-US", {
+      timeZone: tzName, hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).formatToParts(new Date(now)).reduce((a, x) => {
+      if (x.type !== "literal") a[x.type] = x.value; return a;
+    }, {});
+    const wall = Date.UTC(+p.year, +p.month - 1, +p.day,
+      +p.hour % 24, +p.minute, +p.second);
+    tz = wall - (now - (now % 1000));
+    /* 越界说明换算出错，退回 0（UTC）而不是喂给分桶 */
+    if (Math.abs(tz) >= 15 * 3600000) tz = 0;
+  } catch (e) { tz = 0; }
+  const dayIndex = Math.floor((now + tz) / 86400000);
+  return {
+    startMs: dayIndex * 86400000 - tz,
+    endMs: now,
+    tzOffsetMs: tz,
+  };
+}
+
+/* 列出要取数的远程源。
+ * 默认：从客户端的连接档案自动发现（SSH / WSL / Docker）——
+ * 用户在客户端里配过的远程，插件自动跟上，不用手填、不用写密码。
+ * 配置里的 remote_sources 仍然有效，用作「手动补充」（enabled:false 可关掉某个自动发现的源）。 */
+function remoteSources() {
+  const cfg = readCfgCached();
+  const out = [];
+  const seen = new Set();
+
+  if (cfg.discover_remote !== false) {
+    try {
+      for (const p of rem().discoverProfiles()) {
+        const key = p.kind + "|" + (p.host || p.distro || p.container) + "|" +
+                    (p.port || "") + "|" + (p.user || "");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        p.timeout = cfg.remote_timeout_ms || 25000;
+        out.push(p);
+      }
+    } catch (e) {
+      LOG("发现远程档案失败:", e.message);
+    }
+  }
+
+  /* 手动补充的源。没被自动发现覆盖的才加进来，避免同一台机器取两遍。 */
+  for (const s of (cfg.remote_sources || [])) {
+    if (!s || s.enabled === false) continue;
+    const key = s.kind + "|" + (s.host || s.distro || s.container) + "|" +
+                (s.port || "") + "|" + (s.user || "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
+/* 逐个远程源取快照。单个源失败不影响其它源。 */
+async function collectRemote(window) {
+  const srcs = remoteSources();
+  if (!srcs.length) return [];
+  const results = await Promise.all(srcs.map(async (src) => {
+    const label = src.label || rem().sourceLabel(src);
+    try {
+      const snap = await rem().fetchSnapshot(src, window, src.timeout || 25000);
+      return { source: label, snapshot: snap };
+    } catch (e) {
+      return { source: label, error: String((e && e.message) || e).slice(0, 300) };
+    }
+  }));
+  return results;
 }
 
 /* ---------------------------------------------------------------- 触发与限频 */
@@ -311,7 +437,12 @@ function maybeSpawn() {
   }
   lastSpawn = now;
   if (st) lastStamp = st;
-  runQuery();
+  /* runQuery 是异步的（要先取远程）。busy 由它自己管，
+   * 这里不 await —— 避免把 maybeSpawn 的调用栈堵住。 */
+  Promise.resolve(runQuery()).catch((e) => {
+    LOG("取数失败:", e && e.message);
+    busy = false;
+  });
 }
 
 let debounceTimer = 0;
